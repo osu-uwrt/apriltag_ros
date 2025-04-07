@@ -13,6 +13,8 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+// Added SetBool service include
+#include <std_srvs/srv/set_bool.hpp>
 
 // apriltag
 #include "tag_functions.hpp"
@@ -117,13 +119,32 @@ private:
 
     std::function<void(apriltag_family_t*)> tf_destructor;
 
-    const image_transport::CameraSubscriber sub_cam;
+    // Changed to store as a member variable rather than a const
+    image_transport::CameraSubscriber sub_cam;
     const rclcpp::Publisher<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr pub_detections;
     tf2_ros::TransformBroadcaster tf_broadcaster;
+    
+    // Added service to enable/disable the subscription
+    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr srv_toggle_subscription;
+    
+    // Added flag to track subscription state
+    bool subscription_active;
+    std::string image_transport_type;
 
     void onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img, const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci);
 
     rcl_interfaces::msg::SetParametersResult onParameter(const std::vector<rclcpp::Parameter>& parameters);
+    
+    // Added service callback
+    void onToggleSubscription(
+        const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+        std::shared_ptr<std_srvs::srv::SetBool::Response> response);
+        
+    // Added function to create the subscription
+    void createSubscription();
+    
+    // Added function to destroy the subscription
+    void destroySubscription();
 };
 
 RCLCPP_COMPONENTS_REGISTER_NODE(AprilTagNode)
@@ -135,13 +156,17 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     cb_parameter(add_on_set_parameters_callback(std::bind(&AprilTagNode::onParameter, this, std::placeholders::_1))),
     td(apriltag_detector_create()),
     // topics
-    sub_cam(image_transport::create_camera_subscription(this, "image_rect", std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1, std::placeholders::_2), declare_parameter("image_transport", "raw", descr({}, true)), rmw_qos_profile_sensor_data)),
     pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
-    tf_broadcaster(this)
+    tf_broadcaster(this),
+    // Initialize subscription flag as active
+    subscription_active(true)
 {
     // read-only parameters
     const std::string tag_family = declare_parameter("family", "36h11", descr("tag family", true));
     tag_edge_size = declare_parameter("size", 1.0, descr("default tag size", true));
+    
+    // Store the image transport type
+    image_transport_type = declare_parameter("image_transport", "raw", descr({}, true));
 
     // get tag names, IDs and sizes
     const auto ids = declare_parameter("tag.ids", std::vector<int64_t>{}, descr("tag ids", true));
@@ -182,12 +207,71 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     else {
         throw std::runtime_error("Unsupported tag family: " + tag_family);
     }
+    
+    // Create the subscription initially
+    createSubscription();
+    
+    // Create the service for toggling the subscription
+    srv_toggle_subscription = create_service<std_srvs::srv::SetBool>(
+        "toggle_subscription",
+        std::bind(&AprilTagNode::onToggleSubscription, this, std::placeholders::_1, std::placeholders::_2)
+    );
 }
 
 AprilTagNode::~AprilTagNode()
 {
+    destroySubscription();
     apriltag_detector_destroy(td);
     tf_destructor(tf);
+}
+
+void AprilTagNode::createSubscription()
+{
+    if (!subscription_active) {
+        sub_cam = image_transport::create_camera_subscription(
+            this, 
+            "image_rect", 
+            std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1, std::placeholders::_2), 
+            image_transport_type, 
+            rmw_qos_profile_sensor_data
+        );
+        subscription_active = true;
+        RCLCPP_INFO(get_logger(), "Camera subscription created");
+    }
+}
+
+void AprilTagNode::destroySubscription()
+{
+    if (subscription_active) {
+        sub_cam.shutdown();
+        subscription_active = false;
+        RCLCPP_INFO(get_logger(), "Camera subscription destroyed");
+    }
+}
+
+void AprilTagNode::onToggleSubscription(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+{
+    if (request->data && !subscription_active) {
+        // Create the subscription if requested and it doesn't exist
+        createSubscription();
+        response->success = true;
+        response->message = "Subscription activated";
+    } 
+    else if (!request->data && subscription_active) {
+        // Destroy the subscription if requested and it exists
+        destroySubscription();
+        response->success = true;
+        response->message = "Subscription deactivated";
+    } 
+    else {
+        // No change needed
+        response->success = true;
+        response->message = request->data ? 
+            "Subscription was already active" : 
+            "Subscription was already inactive";
+    }
 }
 
 void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img,
