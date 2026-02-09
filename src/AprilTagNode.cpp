@@ -159,7 +159,7 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
     tf_broadcaster(this),
     // Initialize subscription flag as active
-    subscription_active(true)
+    subscription_active(false)
 {
     // read-only parameters
     const std::string tag_family = declare_parameter("family", "36h11", descr("tag family", true));
