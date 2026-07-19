@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.16)
 
 project(apriltag_ros)
 
@@ -6,7 +6,9 @@ set(CMAKE_CXX_STANDARD 14)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Werror -Wall -Wextra -Wpedantic)
-  add_link_options("-Wl,-z,relro,-z,now,-z,defs")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_link_options("-Wl,-z,relro,-z,now,-z,defs")
+  endif()
 endif()
 
 option(ASAN "use AddressSanitizer to detect memory issues" OFF)
@@ -39,22 +41,98 @@ find_package(apriltag_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(cv_bridge REQUIRED)
-find_package(Eigen3 REQUIRED)
+find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(Threads REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core calib3d)
 find_package(apriltag 3.2 REQUIRED)
 
 if(cv_bridge_VERSION VERSION_GREATER_EQUAL 3.3.0)
     add_compile_definitions(cv_bridge_HPP)
 endif()
 
-add_library(tags OBJECT src/tag_functions.cpp)
-target_link_libraries(tags apriltag::apriltag)
-set_property(TARGET tags PROPERTY POSITION_INDEPENDENT_CODE ON)
+if(image_transport_VERSION VERSION_GREATER_EQUAL 6.3)
+    add_compile_definitions(image_transport_QoS)
+endif()
 
-add_library(AprilTagNode SHARED src/AprilTagNode.cpp)
-ament_target_dependencies(AprilTagNode rclcpp rclcpp_components sensor_msgs apriltag_msgs tf2_ros image_transport cv_bridge)
-target_link_libraries(AprilTagNode apriltag::apriltag tags Eigen3::Eigen)
-rclcpp_components_register_node(AprilTagNode PLUGIN "AprilTagNode" EXECUTABLE "apriltag_node")
+if(image_transport_VERSION VERSION_GREATER_EQUAL 6.4)
+    add_compile_definitions(image_transport_NODE_INTERFACE)
+endif()
+
+if(tf2_ros_VERSION VERSION_GREATER_EQUAL 0.45)
+    add_compile_definitions(tf2_ros_NODE_INTERFACE)
+endif()
+
+
+# database of tag functions
+add_library(tags STATIC
+    src/tag_functions.cpp
+)
+target_link_libraries(tags
+    apriltag::apriltag
+)
+set_property(TARGET tags PROPERTY
+    POSITION_INDEPENDENT_CODE ON
+)
+
+
+# conversion functions as template specialisation
+add_library(conversion STATIC
+    src/conversion.cpp
+)
+target_link_libraries(conversion
+  PUBLIC
+    apriltag::apriltag
+    Eigen3::Eigen
+    opencv_core
+    ${geometry_msgs_TARGETS}
+    tf2::tf2
+)
+set_property(TARGET conversion PROPERTY
+    POSITION_INDEPENDENT_CODE ON
+)
+
+
+# pose estimation methods
+add_library(pose_estimation STATIC
+    src/pose_estimation.cpp
+)
+target_link_libraries(pose_estimation
+  PUBLIC
+    apriltag::apriltag
+    Eigen3::Eigen
+    opencv_calib3d
+    conversion
+    ${geometry_msgs_TARGETS}
+    tf2::tf2
+)
+set_property(TARGET pose_estimation PROPERTY
+    POSITION_INDEPENDENT_CODE ON
+)
+
+
+# composable node
+add_library(AprilTagNode SHARED
+    src/AprilTagNode.cpp
+)
+target_link_libraries(AprilTagNode
+  PUBLIC
+    apriltag::apriltag
+    tags
+    pose_estimation
+    ${apriltag_msgs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    cv_bridge::cv_bridge
+    image_transport::image_transport
+    rclcpp::rclcpp
+    rclcpp_components::component
+    rclcpp_components::component_manager
+    sensor_msgs::sensor_msgs_library
+    tf2_ros::tf2_ros
+)
+rclcpp_components_register_node(AprilTagNode
+    PLUGIN "AprilTagNode"
+    EXECUTABLE "apriltag_node"
+)
 
 ament_environment_hooks(${ament_cmake_package_templates_ENVIRONMENT_HOOK_LIBRARY_PATH})
 
@@ -63,9 +141,13 @@ install(TARGETS AprilTagNode
     LIBRARY DESTINATION lib
 )
 
-install(DIRECTORY cfg/ DESTINATION share/${PROJECT_NAME}/cfg)
+install(DIRECTORY cfg
+    DESTINATION share/${PROJECT_NAME}
+)
 
-install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch
+    DESTINATION share/${PROJECT_NAME}
+)
 
 if(BUILD_TESTING)
   set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-format")
