@@ -1,5 +1,14 @@
 /**:
     ros__parameters:
+        # helps performance a lot
+        quad_decimate: 3.0
+        # give it all the nano cores, as a treat
+        nthreads: 6
+        # no blur
+        quad_sigma: 0.0
+        # fast edge refinement
+        refine_edges: 1
+
         image_transport: raw    # image format
         family: 36h11           # tag family name
         size: 0.173             # tag edge size in meter

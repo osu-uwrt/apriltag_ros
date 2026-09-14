@@ -233,7 +233,7 @@ void AprilTagNode::createSubscription()
             "image_rect", 
             std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1, std::placeholders::_2), 
             image_transport_type, 
-            rmw_qos_profile_sensor_data
+            rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile().get_rmw_qos_profile()
         );
         subscription_active = true;
         RCLCPP_INFO(get_logger(), "Camera subscription created");
