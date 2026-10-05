@@ -11,7 +11,9 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/image_encodings.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 // Added SetBool service include
 #include <std_srvs/srv/set_bool.hpp>
@@ -21,6 +23,7 @@
 #include <apriltag.h>
 
 #include <Eigen/Dense>
+#include <opencv2/imgcodecs.hpp>
 
 
 #define IF(N, V) \
@@ -121,6 +124,13 @@ private:
 
     // Changed to store as a member variable rather than a const
     image_transport::CameraSubscriber sub_cam;
+    // image_transport "compressed": the JPEGs are decoded here with this node's own OpenCV (the compressed
+    // image_transport plugin is built against ROS's; with this node's OpenCV in the same process, its decode
+    // fails), and the latest camera info is used rather than one stamped exactly like each image
+    rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_compressed;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_info;
+    std::mutex info_mutex;
+    sensor_msgs::msg::CameraInfo::ConstSharedPtr latest_info;
     const rclcpp::Publisher<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr pub_detections;
     tf2_ros::TransformBroadcaster tf_broadcaster;
     
@@ -132,6 +142,8 @@ private:
     std::string image_transport_type;
 
     void onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img, const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci);
+    void onCompressed(const sensor_msgs::msg::CompressedImage::ConstSharedPtr& msg_img);
+    void detect(const cv::Mat& img_uint8, const std_msgs::msg::Header& header, const sensor_msgs::msg::CameraInfo& ci);
 
     rcl_interfaces::msg::SetParametersResult onParameter(const std::vector<rclcpp::Parameter>& parameters);
     
@@ -227,7 +239,20 @@ AprilTagNode::~AprilTagNode()
 
 void AprilTagNode::createSubscription()
 {
-    if (!subscription_active) {
+    if (!subscription_active && image_transport_type == "compressed") {
+        sub_info = create_subscription<sensor_msgs::msg::CameraInfo>(
+            "camera_info", rclcpp::SensorDataQoS(),
+            [this](const sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
+                std::lock_guard<std::mutex> lock(info_mutex);
+                latest_info = msg;
+            });
+        sub_compressed = create_subscription<sensor_msgs::msg::CompressedImage>(
+            "image_rect/compressed", rclcpp::SensorDataQoS(),
+            std::bind(&AprilTagNode::onCompressed, this, std::placeholders::_1));
+        subscription_active = true;
+        RCLCPP_INFO(get_logger(), "Camera subscription created (compressed: %s)", sub_compressed->get_topic_name());
+    }
+    else if (!subscription_active) {
         sub_cam = image_transport::create_camera_subscription(
             this, 
             "image_rect", 
@@ -244,6 +269,8 @@ void AprilTagNode::destroySubscription()
 {
     if (subscription_active) {
         sub_cam.shutdown();
+        sub_compressed.reset();
+        sub_info.reset();
         subscription_active = false;
         RCLCPP_INFO(get_logger(), "Camera subscription destroyed");
     }
@@ -274,14 +301,52 @@ void AprilTagNode::onToggleSubscription(
     }
 }
 
+void AprilTagNode::onCompressed(const sensor_msgs::msg::CompressedImage::ConstSharedPtr& msg_img)
+{
+    sensor_msgs::msg::CameraInfo::ConstSharedPtr ci;
+    {
+        std::lock_guard<std::mutex> lock(info_mutex);
+        ci = latest_info;
+    }
+    if(!ci) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Waiting for camera info");
+        return;
+    }
+    const cv::Mat img_uint8 = cv::imdecode(
+        cv::Mat(1, int(msg_img->data.size()), CV_8UC1, const_cast<std::uint8_t*>(msg_img->data.data())),
+        cv::IMREAD_GRAYSCALE);
+    if(img_uint8.empty()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Could not decode a '%s' image", msg_img->format.c_str());
+        return;
+    }
+    detect(img_uint8, msg_img->header, *ci);
+}
+
 void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_img,
                             const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg_ci)
 {
-    // precompute inverse projection matrix
-    const Mat3 Pinv = Eigen::Map<const Eigen::Matrix<double, 3, 4, Eigen::RowMajor>>(msg_ci->p.data()).leftCols<3>().inverse();
+    // Convert to 8-bit monochrome explicitly. Asking cv_bridge to perform the
+    // conversion as part of toCvShare() aborts with some OpenCV/cv_bridge
+    // combinations when the source is the simulator's rgb8 image.
+    const auto cv_img = cv_bridge::toCvShare(msg_img);
+    cv::Mat img_uint8;
+    if(msg_img->encoding == sensor_msgs::image_encodings::MONO8) {
+        img_uint8 = cv_img->image;
+    } else if(msg_img->encoding == sensor_msgs::image_encodings::RGB8) {
+        cv::cvtColor(cv_img->image, img_uint8, cv::COLOR_RGB2GRAY);
+    } else if(msg_img->encoding == sensor_msgs::image_encodings::BGR8) {
+        cv::cvtColor(cv_img->image, img_uint8, cv::COLOR_BGR2GRAY);
+    } else {
+        img_uint8 = cv_bridge::toCvCopy(msg_img, sensor_msgs::image_encodings::MONO8)->image;
+    }
+    detect(img_uint8, msg_img->header, *msg_ci);
+}
 
-    // convert to 8bit monochrome image
-    const cv::Mat img_uint8 = cv_bridge::toCvShare(msg_img, "mono8")->image;
+void AprilTagNode::detect(const cv::Mat& img_uint8, const std_msgs::msg::Header& header,
+                          const sensor_msgs::msg::CameraInfo& ci)
+{
+    // precompute inverse projection matrix
+    const Mat3 Pinv = Eigen::Map<const Eigen::Matrix<double, 3, 4, Eigen::RowMajor>>(ci.p.data()).leftCols<3>().inverse();
 
     image_u8_t im{img_uint8.cols, img_uint8.rows, img_uint8.cols, img_uint8.data};
 
@@ -294,7 +359,7 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
         timeprofile_display(td->tp);
 
     apriltag_msgs::msg::AprilTagDetectionArray msg_detections;
-    msg_detections.header = msg_img->header;
+    msg_detections.header = header;
 
     std::vector<geometry_msgs::msg::TransformStamped> tfs;
 
@@ -327,7 +392,7 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
 
         // 3D orientation and position
         geometry_msgs::msg::TransformStamped tf;
-        tf.header = msg_img->header;
+        tf.header = header;
         // set child frame name by generic tag name or configured tag name
         tf.child_frame_id = tag_frames.count(det->id) ? tag_frames.at(det->id) : std::string(det->family->name) + ":" + std::to_string(det->id);
         getPose(*(det->H), Pinv, tf.transform, tag_sizes.count(det->id) ? tag_sizes.at(det->id) : tag_edge_size);
